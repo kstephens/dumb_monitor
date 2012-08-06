@@ -139,7 +139,10 @@ class Main
     end
     self
   end
-  IGNORE = [ :count, :median, :sum ].freeze
+
+  def ignore_bucket_items
+    EMPTY_Array
+  end
 
   # Returns a configured Dumbstats::Graphite instance, running in its own Thread.
   def graphite

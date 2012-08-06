@@ -1,5 +1,7 @@
 require "dumb_monitor/version"
 
 module DumbMonitor
-  # Your code goes here...
+  EMPTY_Hash   = {}.freeze
+  EMPTY_Array  = [].freeze
+  EMPTY_String = ''.freeze
 end
