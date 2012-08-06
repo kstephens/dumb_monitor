@@ -187,10 +187,27 @@ class Main
 
   def collect_stats! data
     self.service_stats_prev ||= Dumbstats::Stats.new
-    h = parse_stats! data
-    pp h
+    stats = parse_stats! data
+    stats.each do | k, v |
+      next if ignore_stats_keys.include?(k)
+      v = v.to_i
+      if count_stats_keys.include?(k)
+        service_stats.add_delta! k, service_stats_prev[k]
+      else
+        service_stats.add! k, v
+      end
+    end
+    service_stats_prev.update(service_stats)
     raise "UNIMPLEMENTED"
     self
+  end
+
+  def ignore_stats_keys
+    EMPTY_Array
+  end
+
+  def count_stats_keys
+    EMPTY_Array
   end
 
   def parse_stats! lines
@@ -205,6 +222,6 @@ class Main
     STDERR.puts "#{$0}: #{self}: ERROR #{exc.inspect}\n  #{exc.backtrace * "\n  "}"
     raise
   end
-end # end
+end # class
 end # module
 
