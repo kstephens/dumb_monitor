@@ -9,7 +9,7 @@ require 'dumbstats/stats'
 module DumbMonitor
 class Main
   attr_accessor :opts, :host, :running, :exception
-  attr_accessor :sample_rate, :interval, :dt, :now
+  attr_accessor :sample_interval, :interval, :dt, :now
   attr_accessor :status_file, :status_dir
   attr_accessor :client
   attr_accessor :stats # global stats
@@ -31,7 +31,7 @@ class Main
       k, v = v.split('=', 2)
       opts[k.to_sym] = v
     end
-    self.sample_rate = (opts[:sample_rate] || 1).to_f
+    self.sample_interval = (opts[:sample_interval] || 1).to_f
     self.interval = (opts[:interval] || 60).to_i
     self
   end
@@ -65,7 +65,7 @@ class Main
         self.exception = exc
         self.running = false
       end
-      sleep sample
+      sleep sample_interval
     end
 
     raise self.exception if self.exception
