@@ -12,12 +12,15 @@ class Main
   attr_accessor :sample_interval, :interval, :dt, :now
   attr_accessor :status_file, :status_dir
   attr_accessor :client
-  attr_accessor :stats # global stats
-  attr_accessor :service_stats # Dumbstats::Stats
-  attr_accessor :service_stats_prev
+  attr_accessor :stats # Global stats collected over :interval
+  attr_accessor :service_stats # Service stats collected over :interval
+  attr_accessor :service_sample # Hash of raw values, sampled via parse_stats!
+  attr_accessor :service_sample_prev # Hash merged from service_sample until send_stats!
 
   def initialize
     self.stats = Dumbstats::Stats.new(:name => stats_name)
+    self.sample_interval = 1
+    self.interval = 60
   end
 
   def stats_name
@@ -31,8 +34,12 @@ class Main
       k, v = v.split('=', 2)
       opts[k.to_sym] = v
     end
-    self.sample_interval = (opts[:sample_interval] || 1).to_f
-    self.interval = (opts[:interval] || 60).to_i
+    if x = opts[:sample_interval]
+      self.sample_interval = x.to_f
+    end
+    if x = opts[:interval]
+      self.interval = x.to_i
+    end
     self
   end
 
@@ -41,27 +48,19 @@ class Main
   end
 
   def run_monitor!
-    @stats_last_delivery = Time.now.utc
-
     self.running = true
     Signal.trap("TERM") do
       self.running = false
       exit 1
     end
 
-    self.status_dir = opts[:status_dir] || '.'
-    self.status_file = opts[:status_file] || "#{status_dir}/#{host[:host]}:#{host[:port]}.status"
+    before_run!
 
     while @running
       begin
-        data = get_stats!
-        self.now = Time.now.utc
-        stats.count! :samples
-        write_status_file! data
-        collect_stats! data
-        deliver_stats!
+        sample!
       rescue ::Exception => exc
-        $stderr.puts "#{$0}: ERROR in run_monitor!: #{exc.inspect}\n  #{exc.backtrace * "\n  "}"
+        _log exc
         self.exception = exc
         self.running = false
       end
@@ -70,7 +69,32 @@ class Main
 
     raise self.exception if self.exception
 
-    $stdout.puts "DONE!"
+    _log "run_monitor!: DONE!"
+    self
+  ensure
+    after_run!
+  end
+
+  def before_run!
+    self.status_dir = opts[:status_dir] || '.'
+    self.status_file = opts[:status_file] || "#{status_dir}/#{host[:host]}:#{host[:port]}.status"
+    self.service_stats = Dumbstats::Stats.new
+    self
+  end
+
+  def after_run!
+    self
+  end
+
+  def sample!
+    @stats_last_delivery ||= Time.now.utc
+    data = get_stats!
+    self.now = Time.now.utc
+    stats.count! :samples
+    write_status_file! data
+    collect_stats! data
+    dump_raw!(service_sample) if opts[:dump_sample]
+    check_stats_interval!
     self
   end
 
@@ -78,8 +102,11 @@ class Main
     return client if client
     host = self.host
     self.client = TCPSocket.new(host[:host], host[:port])
+    _log "Connected to #{host.inspect}"
+  rescue ::SystemExit, ::Interrupt, ::SignalException
+    raise
   rescue ::Exception => exc
-    $stderr.puts "#{$0}: #{self}: ERROR in connect_client! #{host.inspect}: #{exc.inspect}\n  #{exc.backtrace * "\n  "}"
+    _log exc
     sleep 10
     retry
   end
@@ -102,31 +129,59 @@ class Main
     self
   end
 
-  def deliver_stats!
+  def collect_stats! data
+    self.service_sample_prev ||= { }
+    self.service_sample = parse_stats! data
+    service_sample.each do | k, v |
+      next if ignore_stats_keys.include?(k)
+      v = v.to_i
+      if count_stats_keys.include?(k)
+        # $stderr.puts "  #{k.inspect} #{service_sample_prev[k].inspect} => #{v.inspect}"
+        service_stats.add_delta! k, service_sample_prev[k], v
+        service_sample_prev[k] = v
+      else
+        service_stats.add! k, v
+      end
+    end
+    self
+  end
+
+  # Subclass override.
+  def ignore_stats_keys; EMPTY_Array; end
+  # Subclass override.
+  def count_stats_keys; EMPTY_Array; end
+
+  def parse_stats! lines
+    raise "Subclass Responsibility"
+  end
+
+
+  def check_stats_interval!
     if (@dt = now - @stats_last_delivery) >= interval
+      deliver_stats!
+    end
+    self
+  end
+
+    def deliver_stats!
       $stderr.write "+" if opts[:tick]
       @stats_last_delivery = now
 
       # Convert counters to rates.
       stats[:samples].rate!(dt)
-      serivce_stats.each do | k, b |
-        b.rate! dt if k != :size
+      service_stats.each do | k, b |
+        b.rate!(dt) if count_stats_keys.include?(k)
       end
       service_stats.finish!
 
-      if opts[:graphite_host]
-        send_to_graphite!
-      end
-      if opts[:dump_stats]
-        dump_stats!
-      end
+      send_to_graphite! if opts[:graphite_host]
+      dump_stats! if opts[:dump_stats]
 
       # Empty stats
       service_stats.clear!
       stats.clear!
+      self
     end
-    self
-  end
 
   def send_to_graphite!
     g = graphite
@@ -134,15 +189,14 @@ class Main
     service_stats.each do | k, b |
       g.add_bucket!(b,
         :now => now,
-        :ignore => IGNORE
+        :ignore => ignore_bucket_items
         )
     end
     self
   end
 
-  def ignore_bucket_items
-    EMPTY_Array
-  end
+  # Subclass override.
+  def ignore_bucket_items; EMPTY_Array; end
 
   # Returns a configured Dumbstats::Graphite instance, running in its own Thread.
   def graphite
@@ -154,22 +208,32 @@ class Main
                           :host => opts[:graphite_host],
                           :port => opts[:graphite_port]
                           )
-    g.prefix = "#{opts[:graphite_prefix]}stomp.#{graphite_path_host g}.#{host[:port]}."
+    g.prefix = "#{opts[:graphite_prefix]}#{graphite_prefix}#{graphite_path_host g}.#{host[:port]}."
     if log = opts[:graphite_log]
-      $stderr.puts "  #{$$} opening #{log.inspect}"
+      _log "opening #{log.inspect}"
       g.log_io = File.open(log, "w+")
       File.chmod(0666, log) rescue nil
     end
     Thread.new do
-      $stderr.puts "  #{$$} created #{g} in #{Thread.current}"
+      _log "created #{g} in #{Thread.current}"
       g.run!
     end
     @graphite = g
   end
 
+  # Subclass override.
+  def graphite_prefix; EMPTY_String; end
+
   def graphite_path_host g
     @graphite_path_host ||=
       g.encode_path(opts[:graphite_path_host] || host[:host].sub(/\.[^.]+\.[^.]+$/, '')).freeze
+  end
+
+  def dump_raw! data, out = nil
+    out ||= $stdout
+    out.puts "============================================"
+    PP.pp(data, out)
+    out.flush
   end
 
   def dump_stats! out = nil
@@ -185,43 +249,24 @@ class Main
     self
   end
 
-  def collect_stats! data
-    self.service_stats_prev ||= Dumbstats::Stats.new
-    stats = parse_stats! data
-    stats.each do | k, v |
-      next if ignore_stats_keys.include?(k)
-      v = v.to_i
-      if count_stats_keys.include?(k)
-        service_stats.add_delta! k, service_stats_prev[k]
-      else
-        service_stats.add! k, v
-      end
-    end
-    service_stats_prev.update(service_stats)
-    raise "UNIMPLEMENTED"
-    self
-  end
-
-  def ignore_stats_keys
-    EMPTY_Array
-  end
-
-  def count_stats_keys
-    EMPTY_Array
-  end
-
-  def parse_stats! lines
-    raise "Subclass Responsibility"
-  end
-
   def run!
     parse_opts!
     connect_client!
     run_monitor!
   rescue ::Exception => exc
-    STDERR.puts "#{$0}: #{self}: ERROR #{exc.inspect}\n  #{exc.backtrace * "\n  "}"
+    _log exc
     raise
   end
+
+  def _log msg = nil
+    msg ||= yield if block_given?
+    case msg
+    when ::Exception
+      msg = "ERROR: #{msg.inspect}\n  #{msg.backtrace * "\n  "}"
+    end
+    $stderr.puts "#{Time.now.utc.iso8601(3)} #{$$} #{self} #{msg}"
+  end
+
 end # class
 end # module
 
