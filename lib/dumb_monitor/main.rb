@@ -226,7 +226,13 @@ class Main
 
   def graphite_path_host g
     @graphite_path_host ||=
-      g.encode_path(opts[:graphite_path_host] || host[:host].sub(/\.[^.]+\.[^.]+$/, '')).freeze
+      (
+      if h = host[:host] and h !~ /^[.0-9]+$/
+        # Trim TLD off hostname.
+        h = h.sub(/\.[^.]+\.[^.]+$/, '')
+      end
+      g.encode_path(opts[:graphite_path_host] || h)
+      ).freeze
   end
 
   def dump_raw! data, out = nil
