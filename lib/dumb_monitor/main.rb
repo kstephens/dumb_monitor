@@ -174,7 +174,7 @@ class Main
       end
       service_stats.finish!
 
-      send_to_graphite! if opts[:graphite_host]
+      send_to_graphite! if opts[:graphite_host] || opts[:testing]
       dump_stats! if opts[:dump_stats]
 
       # Empty stats
