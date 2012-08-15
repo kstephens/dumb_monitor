@@ -1,13 +1,29 @@
+$debugger = false
+if ENV['RUBY_DEBUG']
+  case RUBY_VERSION
+  when /^1\.9/
+    gem 'debugger'
+    require 'debugger'
+  else
+    gem 'ruby-debug'
+    require 'ruby-debug'
+  end
+  $debugger = true
+end
+
 require 'dumb_monitor'
+require 'dumb_monitor/logging'
 
 require 'time' # iso8601
 require 'pp'
 
 require 'dumbstats'
 require 'dumbstats/stats'
+require 'dumb_monitor/logging'
 
 module DumbMonitor
 class Main
+  include Logging
   attr_accessor :opts, :host, :running, :exception
   attr_accessor :sample_interval, :interval, :dt, :now
   attr_accessor :status_file, :status_dir
@@ -48,14 +64,16 @@ class Main
   end
 
   def run_monitor!
-    self.running = true
-    Signal.trap("TERM") do
-      self.running = false
-      exit 1
-    end
-
     before_run!
+    run_monitor_loop!
+    raise self.exception if self.exception
+    _log "run_monitor!: DONE!"
+    self
+  ensure
+    after_run!
+  end
 
+  def run_monitor_loop!
     while @running
       begin
         sample!
@@ -67,15 +85,16 @@ class Main
       sleep sample_interval
     end
 
-    raise self.exception if self.exception
-
-    _log "run_monitor!: DONE!"
     self
-  ensure
-    after_run!
   end
 
   def before_run!
+    self.running = true
+    @save_TERM = Signal.trap("TERM") do
+      self.running = false
+      exit 1
+    end
+
     self.status_dir = opts[:status_dir] || '.'
     self.status_file = opts[:status_file] || "#{status_dir}/#{host[:host]}:#{host[:port]}.status"
     self.service_stats = Dumbstats::Stats.new
@@ -83,12 +102,13 @@ class Main
   end
 
   def after_run!
+    Signal.trap("TERM", @save_TERM)
     self
   end
 
-  def sample!
+  def sample! data = nil
     @stats_last_delivery ||= Time.now.utc
-    data = get_stats!
+    data = get_stats! unless data
     self.now = Time.now.utc
     stats.count! :samples
     write_status_file! data
@@ -101,7 +121,7 @@ class Main
   def connect_client!
     return client if client
     host = self.host
-    self.client = TCPSocket.new(host[:host], host[:port])
+    _connect_client!
     _log "Connected to #{host.inspect}"
   rescue ::SystemExit, ::Interrupt, ::SignalException
     raise
@@ -109,6 +129,10 @@ class Main
     _log exc
     sleep 10
     retry
+  end
+
+  def _connect_client!
+    self.client = TCPSocket.new(host[:host], host[:port])
   end
 
   def get_stats!
@@ -164,15 +188,13 @@ class Main
   end
 
     def deliver_stats!
+      before_deliver_stats!
       $stderr.write "+" if opts[:tick]
       @stats_last_delivery = now
 
-      # Convert counters to rates.
       stats[:samples].rate!(dt)
-      service_stats.each do | k, b |
-        b.rate!(dt) if count_stats_keys.include?(k)
-      end
-      service_stats.finish!
+      prepare_stats!
+      stats.finish!
 
       send_to_graphite! if opts[:graphite_host] || opts[:testing]
       dump_stats! if opts[:dump_stats]
@@ -180,12 +202,32 @@ class Main
       # Empty stats
       service_stats.clear!
       stats.clear!
+      after_deliver_stats!
+      self
+    end
+
+    def prepare_stats!
+      # Convert counters to rates.
+      service_stats.each do | k, b |
+        b.rate!(dt) if count_stats_keys.include?(k)
+      end
+      service_stats.finish!
+      self
+    end
+
+    def before_deliver_stats!
+      self
+    end
+
+    def after_deliver_stats!
       self
     end
 
   def send_to_graphite!
     g = graphite
-    g.add_bucket! stats[:samples]
+    stats.each do | k, b |
+      g.add_bucket! b, :now => now, :ignore => ignore_bucket_items
+    end
     service_stats.each do | k, b |
       g.add_bucket!(b,
         :now => now,
@@ -262,15 +304,6 @@ class Main
   rescue ::Exception => exc
     _log exc
     raise
-  end
-
-  def _log msg = nil
-    msg ||= yield if block_given?
-    case msg
-    when ::Exception
-      msg = "ERROR: #{msg.inspect}\n  #{msg.backtrace * "\n  "}"
-    end
-    $stderr.puts "#{Time.now.utc.iso8601(3)} #{$$} #{self} #{msg}"
   end
 
 end # class
