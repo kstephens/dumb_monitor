@@ -253,7 +253,7 @@ class Main
     g.prefix = "#{opts[:graphite_prefix]}#{graphite_prefix}#{graphite_path_host g}.#{host[:port]}."
     if log = opts[:graphite_log]
       _log "opening #{log.inspect}"
-      g.log_io = File.open(log, "w+")
+      g.log_io = File.open(log, "a+")
       File.chmod(0666, log) rescue nil
     end
     Thread.new do
